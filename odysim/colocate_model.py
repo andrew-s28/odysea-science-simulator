@@ -66,8 +66,11 @@ class GriddedModel:
             }
         )
 
+        # self.ds.load()
+
         self.U = self.ds['u']
         self.V = self.ds['v']
+        self.W = self.ds['w']
         self.TX = self.ds['sustr']
         self.TY = self.ds['svstr']
 
@@ -90,12 +93,15 @@ class GriddedModel:
         ds = ds.copy()
         ds['time'] = np.datetime64('1950-01-01') + [np.timedelta64(int(t), 's') for t in ds.scrum_time.values] - np.timedelta64(90, 's')
         ds = ds.drop_dims('auxil')
+        min_time = min_time - np.timedelta64(10, 'D') if min_time is not None else None
+        max_time = max_time + np.timedelta64(10, 'D') if max_time is not None else None
+        ds = ds.sel(time=slice(min_time, max_time))
         # grid file uses eta_u, xi_v, but model uses eta_rho and xi_rho since they are redundant, which screws up masking with DataArrays
         ds['u'] = ds['u'].where(grid.mask_u.values == 1)
         ds['v'] = ds['v'].where(grid.mask_v.values == 1)
+        ds['w'] = ds['w'].where(grid.mask_rho.values == 1)
         ds['temp'] = ds['temp'].where(grid.mask_rho.values == 1)
         ds['salt'] = ds['salt'].where(grid.mask_rho.values == 1)
-        ds = ds.sel(time=slice(min_time, max_time))
         return ds
 
     def colocatePoints(self, lats: np.array, lons: np.array, times: np.array):
@@ -116,10 +122,19 @@ class GriddedModel:
            ty: colocated model v wind stress.
 
         """
+        times = np.array(times)
         if len(times) == 0:
             return [], []
 
         ds_u = self.U.interp(
+            time=times,
+            lat=lats,
+            lon=lons,
+            method='linear',
+            kwargs=self.interp_kwargs,
+        )
+
+        ds_v = self.V.interp(
             time=xr.DataArray(times.flatten(), dims='z'),
             lat=xr.DataArray(lats.flatten(), dims='z'),
             lon=xr.DataArray(lons.flatten(), dims='z'),
@@ -127,7 +142,7 @@ class GriddedModel:
             kwargs=self.interp_kwargs,
         )
 
-        ds_v = self.V.interp(
+        ds_w = self.W.interp(
             time=xr.DataArray(times.flatten(), dims='z'),
             lat=xr.DataArray(lats.flatten(), dims='z'),
             lon=xr.DataArray(lons.flatten(), dims='z'),
@@ -153,13 +168,13 @@ class GriddedModel:
 
         u = np.reshape(ds_u.values, np.shape(lats))
         v = np.reshape(ds_v.values, np.shape(lats))
+        w = np.reshape(ds_w.values, np.shape(lats))
         tx = np.reshape(ds_tx.values, np.shape(lats))
         ty = np.reshape(ds_ty.values, np.shape(lats))
 
-        return u, v, tx, ty
+        return u, v, w, tx, ty
 
     def colocateSwathCurrents(self, orbit):
-
         """
         Colocate model current data to a swath (2d continuous array) of lat/lon/time query points.
             Ensure that lat/lon/time points of query exist within the loaded model data.
@@ -171,36 +186,17 @@ class GriddedModel:
                    new data is contained in u_model, v_model
 
         """
-
-        lats = orbit['lat'].values.flatten()
-        lons = orbit['lon'].values.flatten()
-        times = orbit['sample_time'].values.flatten()
-
-        ds_u = self.U.interp(
-            time=xr.DataArray(times, dims='z'),
-            lat=xr.DataArray(lats, dims='z'),
-            lon=xr.DataArray(lons, dims='z'),
+        ds = self.ds.interp(
+            time=orbit.sample_time,
+            lat=orbit.lat,
+            lon=orbit.lon,
             method='linear',
             kwargs=self.interp_kwargs,
-        )
+        ).reset_coords()
 
-        ds_v = self.V.interp(
-            time=xr.DataArray(times, dims='z'),
-            lat=xr.DataArray(lats, dims='z'),
-            lon=xr.DataArray(lons, dims='z'),
-            method='linear',
-            kwargs=self.interp_kwargs,
-        )
-
-        u_interp = np.reshape(ds_u.values, np.shape(orbit['lat'].values))
-        v_interp = np.reshape(ds_v.values, np.shape(orbit['lat'].values))
-
-        orbit = orbit.assign(
-            {
-                'u_model': (['along_track', 'cross_track'], u_interp),
-                'v_model': (['along_track', 'cross_track'], v_interp)
-            }
-        )
+        orbit['u_model'] = ds['u']
+        orbit['v_model'] = ds['v']
+        orbit['w_model'] = ds['w']
 
         return orbit
 

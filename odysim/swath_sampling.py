@@ -1,15 +1,14 @@
 import xarray as xr
 import numpy as np
-import pandas as pd
 import yaml
 from scipy.interpolate import UnivariateSpline
 import scipy
 import datetime
-from pathlib import Path
 import os
+import time
 import importlib.resources as import_resources
 
-from odysim.coordinates import sch_array_to_llh_array
+from odysim.coordinates import WGS84, sch_to_llh, xyz_to_llh
 from odysim import utils
 
 
@@ -20,100 +19,19 @@ def splineFactory(x, y, k=3, smoothing=None):
     return spl
 
 
-def getBearing(latitude, longitude):
+def get_bearing(latitude, longitude):
+    lat_rad = np.deg2rad(latitude)
+    lon_rad = np.deg2rad(longitude)
     d = 1
-    X = np.zeros(np.shape(latitude))
-    Y = np.zeros(np.shape(latitude))
+    X = np.zeros(np.shape(lat_rad))
+    Y = np.zeros(np.shape(lat_rad))
 
-    X[d::] = np.cos(latitude[d::]) * np.sin(longitude[d::]-longitude[0:-d])
-    Y[d::] = np.cos(latitude[0:-d]) * np.sin(latitude[d::]) - np.sin(latitude[0:-d]) * np.cos(latitude[d::]) * np.cos(longitude[d::]-longitude[0:-d])
+    X[d::] = np.cos(lat_rad[d::]) * np.sin(lon_rad[d::]-lon_rad[0:-d])
+    Y[d::] = np.cos(lat_rad[0:-d]) * np.sin(lat_rad[d::]) - np.sin(lat_rad[0:-d]) * np.cos(lat_rad[d::]) * np.cos(lon_rad[d::]-lon_rad[0:-d])
 
-    t = np.arctan2(X, Y)
+    t = np.rad2deg(np.arctan2(X, Y))
 
     return t
-
-
-def ecef_to_llh(x, y, z):
-    """Go from ECEF geocentric to lat lon height.
-    Parameters
-    ----------
-    x : float or array_like
-        ECEF x coordinate.
-    y : float or array_like
-        ECEF y coordinate.
-    z : float or array_like
-        ECEF z coordinate.
-    Returns
-    -------
-    lat,lon,h
-    lat and lon are in radians. h is in the same units as x,y,z.
-    """
-
-    # Longitude
-
-    lon = np.arctan2(y,x)
-
-    # Geodetic Latitude
-
-    projRad = np.sqrt(x*x + y*y)
-
-    alpha = np.arctan2(
-        z,
-        (projRad*np.sqrt(1. - WGS84.ECCENTRICITY_SQ))
-    )
-    sa = np.sin(alpha)
-    ca = np.cos(alpha)
-    sa3 = sa*sa*sa
-    ca3 = ca*ca*ca
-
-    lat = np.arctan2(
-        (z + WGS84.EP_SQUARED*WGS84.SEMIMINOR_AXIS*sa3),
-        (projRad - WGS84.ECCENTRICITY_SQ*WGS84.SEMIMAJOR_AXIS*ca3)
-    )
-
-    # height
-
-    h = projRad/np.cos(lat) - WGS84.eastRad(lat)
-
-    return lat, lon, h
-
-
-class WGS84:
-    """Definition of WGS84 ellipsoid and calculation of local radii."""
-
-    # The Earth's constants
-    SEMIMAJOR_AXIS = 6378137.  # in meters
-
-    # SEMIMAJOR_AXIS*sqrt(1-ECCENTRICITY_SQ)
-    SEMIMINOR_AXIS = 6356752.3135930374
-
-    ECCENTRICITY_SQ = 0.00669437999015
-
-    # ECCENTRICITY_SQ/(1-ECCENTRICITY_SQ)
-    EP_SQUARED = 0.0067394969488402
-
-    CENTER_SCALE = 0.9996
-
-    # Auxiliary Functions
-
-    @staticmethod
-    def eastRad(lat):
-        """radius of curvature in the east direction (lat in radians)"""
-        return WGS84.SEMIMAJOR_AXIS/np.sqrt(1. - WGS84.ECCENTRICITY_SQ*np.sin(lat)**2)
-
-    @staticmethod
-    def northRad(lat):
-        """radius of curvature in the north direction (lat in radians)"""
-        return (WGS84.SEMIMAJOR_AXIS*(1. - WGS84.ECCENTRICITY_SQ)/(1. - WGS84.ECCENTRICITY_SQ*np.sin(lat)**2)**1.5)
-
-    @staticmethod
-    def localRad(azimuth, lat):
-        """Local radius of curvature along an azimuth direction measured
-        clockwise from north.
-        (azimuth and latitude in radians)"""
-        return (WGS84.eastRad(lat)*WGS84.northRad(lat) /
-                (WGS84.eastRad(lat)*np.cos(azimuth)**2 +
-                 WGS84.northRad(lat)*np.sin(azimuth)**2))
 
 
 class OdyseaSwath:
@@ -147,7 +65,7 @@ class OdyseaSwath:
         self.loadOrbitXYZ(fn=orbit_fname)
         self.config_fname = config_fname
 
-    def getOrbitSwath(self, orbit_x, orbit_y, orbit_z, orbit_time_stamp, orbit_s, bounds=None, time_offset=None, write=False):
+    def getOrbitSwath(self, orbit_x, orbit_y, orbit_z, orbit_time_stamp, orbit_s, bounds=None, time_offset=np.timedelta64(0, 'D'), write=False):
 
         time_stamp_vector = orbit_time_stamp
         coarse_x = orbit_x
@@ -186,29 +104,19 @@ class OdyseaSwath:
 
         pf_time_smoothed = splineFactory(platform_s, time_stamp_vector, smoothing=0)(s_pegs)
 
-        pf_lat_smoothed, pf_lon_smoothed, pf_h_smoothed = ecef_to_llh(pf_x_smoothed, pf_y_smoothed, pf_z_smoothed)
-        pf_bearing_smoothed = getBearing(pf_lat_smoothed, pf_lon_smoothed)
+        pf_lat_smoothed, pf_lon_smoothed, pf_h_smoothed = xyz_to_llh(pf_x_smoothed, pf_y_smoothed, pf_z_smoothed)
+        pf_bearing_smoothed = get_bearing(pf_lat_smoothed, pf_lon_smoothed)
 
-        for idx_s, s in enumerate(s_pegs):
-
-            peg_lat = pf_lat_smoothed[idx_s]
-            peg_lon = pf_lon_smoothed[idx_s]
-            peg_hdg = pf_bearing_smoothed[idx_s]
-            peg_time = pf_time_smoothed[idx_s]
-            peg_localRadius = WGS84.localRad(peg_hdg, peg_lat)
-
-            slat[idx_s, :], slon[idx_s, :], sh[idx_s, :] = sch_array_to_llh_array(
+        slat, slon, sh = sch_to_llh(
                 0*c_bins.flatten(),
                 c_bins.flatten(),
                 h.flatten(),
-                peg_lat,
-                peg_lon,
-                peg_hdg,
-                peg_localRadius
+                pf_lat_smoothed,
+                pf_lon_smoothed,
+                pf_bearing_smoothed,
+                WGS84.local_radius(pf_bearing_smoothed, pf_lat_smoothed),
             )
-            s_time[idx_s, :] = peg_time
-
-        mask = np.isfinite(slat+slon+s_time)
+        s_time = np.repeat(pf_time_smoothed[:, np.newaxis], nc, axis=1)
 
         sample_time_track = s_time
         sample_lat_track = slat
@@ -221,6 +129,7 @@ class OdyseaSwath:
                 & (sample_lon_track < bounds['lon']['max'])
                 & (sample_lon_track > bounds['lon']['min'])
             )
+            # print(np.sum(region_mask))
             if np.sum(region_mask) > 0:
                 sample_lat_track[~region_mask] = np.nan
                 sample_lon_track[~region_mask] = np.nan
@@ -230,39 +139,7 @@ class OdyseaSwath:
         ds = xr.Dataset()
 
         along_track_sz, cross_track_sz = np.shape(sample_time_track)
-
-        encoding = {
-            "lon": {
-                "dtype": "int16",
-                "zlib": True,
-                'complevel': 9,
-                '_FillValue': -9999,
-                'scale_factor': .01,
-                'add_offset': 180
-            },
-            "lat": {
-                "dtype": "int16",
-                "zlib": True,
-                'complevel': 9,
-                '_FillValue': -9999,
-                'scale_factor': .01,
-                'add_offset': 90
-            },
-            "sample_time": {
-                "dtype": "float32",
-                "zlib": True,
-                'complevel': 9,
-                '_FillValue': -9999,
-                'least_significant_digit': 1
-            },
-            "swath_blanking": {
-                "dtype": "int16",
-                "zlib": True,
-                'complevel': 3,
-                '_FillValue': -9999
-            },
-        }
-
+        # print(along_track_sz, cross_track_sz)
         ds = ds.assign_coords(
             coords={
                 'along_track': (['along_track'], np.arange(0, along_track_sz)),
@@ -270,18 +147,15 @@ class OdyseaSwath:
             }
         )
 
-#         sample_time_track = np.moveaxis(sample_time_track,-1,0)
-#         sample_lat_track  = np.moveaxis(sample_lat_track, -1,0)
-#         sample_lon_track  = np.moveaxis(sample_lon_track, -1,0)
-
-        sample_time_track_dt = [np.datetime64('1970-01-01') + np.timedelta64(int(stt*1000), 'ms') for stt in sample_time_track.flatten()]
+        sample_time_track_dt = (sample_time_track*1000).astype('timedelta64[ms]')
+        sample_time_track_dt = np.datetime64('1970-01-01') + sample_time_track_dt
         sample_time_track_dt = np.reshape(sample_time_track_dt, np.shape(sample_time_track)).astype('datetime64[s]')
 
         ds = ds.assign(
             {
-                'sample_time': (['along_track', 'cross_track'], np.array(sample_time_track_dt)),
-                'lat': (['along_track', 'cross_track'], np.array(sample_lat_track, dtype='float32')),
-                'lon': (['along_track', 'cross_track'], np.array(sample_lon_track, dtype='float32')),
+                'sample_time': (['along_track', 'cross_track'], sample_time_track_dt),
+                'lat': (['along_track', 'cross_track'], sample_lat_track),
+                'lon': (['along_track', 'cross_track'], sample_lon_track),
                 'swath_blanking': (['cross_track'], swath_blanking)
             }
         )
@@ -354,7 +228,7 @@ class OdyseaSwath:
         self.coarse_s = orbit_out['coarse_s']
         # self.orbit_cut_points = np.where(np.diff(np.signbit(self.coarse_lat)))[0][::2]
 
-    def getOrbits(self, start_time, end_time, bounds=None, time_offset=None, set_azimuth=True):
+    def getOrbits(self, start_time, end_time, bounds=None, time_offset=np.timedelta64(0, 'D'), set_azimuth=True):
         """
         Return an iterator that contains xarray datasets, each dataset representing a single Odysea orbit,
             with the full iterator containing all orbits between start_time and end_time.
